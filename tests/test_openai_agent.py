@@ -116,6 +116,29 @@ class OpenAIConfigurationTests(unittest.TestCase):
 
 
 class OpenAIToolRoundTests(unittest.TestCase):
+    def test_luna_disables_reasoning_when_chat_completions_uses_tools(self) -> None:
+        registry = FakeRegistry()
+        http_client = FakeOpenAIHTTPClient(
+            [{"choices": [{"message": {"role": "assistant", "content": "Готово"}}]}]
+        )
+        env = {
+            "OPENAI_API_KEY": "offline-key",
+            "OPENAI_MODEL": "gpt-5.6-luna",
+            "OPENAI_REASONING_EFFORT": "low",
+        }
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(openai_agent, "RemoteMCPRegistry", return_value=registry),
+            mock.patch.object(openai_agent.httpx, "Client", return_value=http_client),
+        ):
+            agent = openai_agent.OpenAIAgent()
+            self.assertEqual(agent.reply("Проверка"), ("Готово", False))
+            agent.close()
+
+        self.assertEqual(
+            http_client.requests[0]["json"]["reasoning_effort"], "none"
+        )
+
     def test_one_mcp_tool_round_then_returns_spoken_answer(self) -> None:
         registry = FakeRegistry()
         http_client = FakeOpenAIHTTPClient(

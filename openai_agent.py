@@ -85,6 +85,18 @@ class OpenAIAgent:
             payload["temperature"] = float(temperature)
         reasoning_effort = os.environ.get("OPENAI_REASONING_EFFORT", "").strip()
         if reasoning_effort:
+            # gpt-5.6-luna rejects function tools together with reasoning on
+            # Chat Completions.  Ringback uses that endpoint for the n8n MCP
+            # bridge, so select the supported mode instead of failing every
+            # spoken turn with HTTP 400.  Other models keep their configured
+            # effort unchanged.
+            if (
+                self.tools
+                and self.model.lower().startswith("gpt-5.6-luna")
+                and self.endpoint.rstrip("/").endswith("/chat/completions")
+                and reasoning_effort.lower() != "none"
+            ):
+                reasoning_effort = "none"
             payload["reasoning_effort"] = reasoning_effort
         if self.tools:
             payload["tools"] = self.tools
