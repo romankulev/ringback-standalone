@@ -65,18 +65,28 @@ def replace_env_values(values: dict[str, str], path: Path = ENV_FILE) -> None:
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     remaining = dict(values)
     output: list[str] = []
+
+    def quoted(value: str) -> str:
+        # JSON values contain many double quotes. Prefer POSIX single-quoted
+        # dotenv values so both this loader and ``source .env`` read them
+        # without interpreting the JSON as shell syntax.
+        if "'" not in value and "\n" not in value and "\r" not in value:
+            return f"'{value}'"
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
     for line in lines:
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             key = stripped.split("=", 1)[0].strip()
             if key in remaining:
-                output.append(f'{key}="{remaining.pop(key)}"')
+                output.append(f"{key}={quoted(remaining.pop(key))}")
                 continue
         output.append(line)
     if remaining:
         if output and output[-1]:
             output.append("")
-        output.extend(f'{key}="{value}"' for key, value in remaining.items())
+        output.extend(f"{key}={quoted(value)}" for key, value in remaining.items())
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
     path.chmod(0o600)
 

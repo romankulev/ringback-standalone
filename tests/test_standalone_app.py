@@ -149,6 +149,18 @@ class DotenvTests(unittest.TestCase):
                 self.assertEqual(os.environ["KEEP"], "from-process")
                 self.assertEqual(os.environ["MODEL"], "/safe/home/model.bin")
 
+    def test_json_value_is_shell_safe_when_written(self) -> None:
+        value = '[{"authorization":"Bearer ${N8N_MCP_TOKEN}"}]'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            configure_telegram.replace_env_values(
+                {"MCP_SERVERS_JSON": value}, path=path
+            )
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                f"MCP_SERVERS_JSON='{value}'\n",
+            )
+
 
 class ConfigurationCheckTests(unittest.TestCase):
     def test_empty_mcp_array_is_reported_missing(self) -> None:
