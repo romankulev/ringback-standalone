@@ -13,7 +13,6 @@ import os
 import struct
 import sys
 import tempfile
-import types
 import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,12 +28,7 @@ if importlib.util.find_spec("livekit") is None:
     sys.exit(0)
 import aec  # noqa: E402
 
-pj = types.ModuleType("pjsua2")
-pj.Call = object
-sys.modules["pjsua2"] = pj
-spec = importlib.util.spec_from_file_location("voice_agent", os.path.join(ROOT, "voice_agent.py"))
-va = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(va)
+import voice_agent as va  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 import math

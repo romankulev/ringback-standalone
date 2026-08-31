@@ -1,13 +1,6 @@
 # --- secrets & local config (never commit) ---
 # (comments MUST be on their own line; trailing comments become part of the pattern)
 .env
-# legacy file with personal data — use alert.env.example instead
-.env.example
-# local SIP identity/password — use voice.env.example instead
-voice.env
-alert.env
-# plain KEY=val cred files generated for `docker --env-file` (see docs/SETUP_DOCKER.md)
-*.docker.env
 
 # --- python ---
 __pycache__/
@@ -16,16 +9,12 @@ __pycache__/
 venv/
 
 # --- local runtime data ---
-ntfy/*.db
 *.wav
 # PRIVATE: harvested real-call voice recordings (never commit)
 tests/fixtures/real/
-channel/outbound.jsonl
-channel/ringback_channel.log
-channel/call_driver.log
-channel/stop_hook.log
-channel/.call_active
-channel/.stop_hook_state.json
+*.log
+*.pid
+runtime/
 
 # --- large downloaded artifacts (fetched by setup.sh) ---
 *.bin

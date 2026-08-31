@@ -1,101 +1,139 @@
-# Ringback — Docker Setup (universal: Linux, Windows, macOS)
+# Ringback Standalone в Docker
 
-The `Dockerfile` builds the **complete voice stack** (pjproject + pjsua2 bindings,
-whisper.cpp, Piper TTS + a voice, ffmpeg, baresip) into one Linux image that runs the
-same everywhere. It's the zero-build option and the recommended way to run on Windows
-(via Docker Desktop). The engine is **headless** — no sound card needed.
+Стандартный Docker-образ — lightweight cloud profile. Он содержит Python-приложение, aiortc, `ffmpeg` и runtime-зависимости. whisper.cpp, Piper, compiler toolchain и сотни мегабайт локальных моделей в образ не входят.
 
-> Why this works: the voice engine never uses a local mic/speaker — all audio is
-> WAV ↔ SIP/RTP and pjsua2 runs on a NULL audio device (`VOICE_NULL_AUDIO=1` in the
-> image). So a container with no audio hardware is a perfectly good runtime.
+По умолчанию ElevenLabs Scribe v2 распознаёт русскую речь, а ElevenLabs TTS озвучивает ответы. Поэтому `ELEVENLABS_API_KEY` и `ELEVENLABS_VOICE_ID` обязательны.
 
-## Build
+## 1. Подготовить `.env`
 
 ```bash
-docker build -t ringback .
+cp .env.example .env
+chmod 600 .env
 ```
 
-First build compiles pjproject + whisper.cpp from source and bakes in a whisper model
-(`base.en`) and a Piper voice (`en_US-lessac-medium`), so it's a few minutes and a
-largish image — but then it just works offline.
+Заполните как минимум:
 
-## Run + register as an MCP server
+- `TELEGRAM_BOT_TOKEN` и `WEBRTC_PUBLIC_URL`;
+- `OPENAI_API_KEY`, `OPENAI_MODEL=gpt-5.6-luna` и `OPENAI_BASE_URL=https://api.openai.com/v1/chat/completions`;
+- `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `VOICE_STT=elevenlabs`, `VOICE_TTS=elevenlabs`;
+- текущий production n8n MCP Trigger URL в `MCP_SERVERS_JSON`.
 
-ringback-voice speaks MCP over stdio, so the container runs with `-i` and your MCP client
-launches it:
+`OPENAI_API_KEY` возьмите из защищённой конфигурации проекта «ИИ телефония» и запишите только в хостовый `.env`. Не печатайте его в логах и не передавайте в чат. [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) поддерживает Chat Completions и function calling; Responses API здесь не обязателен.
 
-First convert your creds to a Docker env-file. `voice.env` uses shell `export KEY="val"`
-syntax, which `docker --env-file` does **not** parse — it wants plain `KEY=val` lines:
+Внешний n8n endpoint должен:
+
+- использовать `https://`;
+- быть production URL опубликованного workflow;
+- передавать Bearer token или секретный custom header.
+
+Пример с Bearer:
+
+```dotenv
+MCP_SERVERS_JSON='[{"server_label":"nami_booking","server_url":"https://YOUR-N8N-HOST/mcp/YOUR-CURRENT-ID","authorization":"Bearer ${N8N_MCP_TOKEN}"}]'
+N8N_MCP_TOKEN="..."
+```
+
+Пример с custom header:
+
+```dotenv
+MCP_SERVERS_JSON='[{"server_label":"nami_booking","server_url":"https://YOUR-N8N-HOST/mcp/YOUR-CURRENT-ID","headers":{"X-MCP-Token":"${N8N_MCP_TOKEN}"}}]'
+```
+
+Legacy n8n URL из сохранённой конфигурации отвечает без отдельной авторизации, поэтому приложение намеренно его отклоняет. Защитите production endpoint; тестовый URL не подходит.
+
+`MCP_TOOL_POLICY` жёстко остаётся `read_only`. `MCP_ALLOWED_TOOLS` только сужает набор и не может включить mutating-ноды.
+
+## 2. Собрать образ
 
 ```bash
-sed -E 's/^[[:space:]]*export //; s/^([A-Z_]+)="?([^"]*)"?$/\1=\2/' voice.env \
-  | grep -E '^[A-Z_]+=' > voice.docker.env      # gitignored; plain KEY=val for Docker
+docker compose build
 ```
 
-Then register the server (your MCP client launches the container on stdio):
+В build context не попадает `.env`. Поскольку нет сборки C++ и загрузки моделей, обычный build значительно быстрее и легче прежнего local-AI образа.
+
+## 3. Защищённая Telegram-привязка
+
+На Linux/macOS запустите helper с подключённым хостовым `.env`:
 
 ```bash
-claude mcp add ringback-voice --scope user -- \
-  docker run -i --rm --network host --env-file voice.docker.env ringback
+docker compose run --rm --no-deps \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/.env:/app/.env" \
+  ringback python configure_telegram.py discover --write
 ```
 
-`voice.docker.env` holds your SIP creds — passed at **runtime** via `--env-file`, never
-baked into the image. (One-off `docker run` from a shell can instead source `voice.env`
-and pass `-e VOICE_SIP_ID -e VOICE_SIP_USER -e VOICE_SIP_PASS …` to keep values off the
-command line.)
+Первый запуск создаст одноразовую команду `/start <код>` и завершится с ожидаемым кодом 2. Отправьте боту в личном чате точно эту команду и повторите тот же `docker compose run`. Второй запуск запишет Telegram ID в хостовый `.env` и ротирует код.
 
-To run the **alert** server instead (ntfy/Pushover/SIP), override the command:
+На Docker Desktop for Windows используйте PowerShell-вариант без Linux UID:
+
+```powershell
+docker compose run --rm --no-deps `
+  -v "${PWD}/.env:/app/.env" `
+  ringback python configure_telegram.py discover --write
+```
+
+После второго `discover --write` настройте кнопку Mini App аналогичной командой, заменив в конце `discover --write` на `configure`.
+
+## 4. Запустить
 
 ```bash
-docker run -i --rm --network host --env-file alert.docker.env ringback python server.py
+docker compose up -d
+docker compose ps
 ```
 
-## Networking (the one thing to get right): RTP
+Готовый `compose.yaml`:
 
-SIP signaling is outbound TLS to Linphone and always works. The **media (RTP/SRTP)** must
-be able to flow back to the container:
+- передаёт `.env` только в runtime;
+- публикует порт только на `127.0.0.1:8765`;
+- добавляет healthcheck и `restart: unless-stopped`;
+- корректно передаёт сигнал остановки через `init: true`.
 
-- **Linux / WSL2** — `--network host` (used above) puts the container on the host network, so
-  pjsua's RTP ports are directly reachable. Simplest and most reliable.
-- **Windows / macOS (Docker Desktop)** — the engine runs inside a NAT'd Linux VM where
-  **neither `--network host` nor `-p` port-publishing delivers the return RTP** — you get
-  one-way audio (you hear the agent; your reply never arrives). The fix is **STUN**: set
-  `VOICE_STUN` so pjsua discovers and advertises its **public** address, and use plain bridge
-  networking:
-
-  ```bash
-  docker run -i --rm \
-    -e VOICE_STUN=stun.l.google.com:19302 \
-    --env-file voice.docker.env ringback
-  ```
-
-  Verified two-way audio + barge-in on Docker Desktop for Mac (Apple Silicon) this way. STUN
-  only discovers your public address (one tiny handshake at call setup); no call audio passes
-  through it. Use `stun.linphone.org` if you'd rather not use Google's. The **Claude Code
-  plugin sets `VOICE_STUN` automatically**, so this is only needed for a manual `docker run`.
-
-## Slimming / overriding models
-
-The image bakes in models for convenience. To keep your own (or shrink the image), mount
-them and point the env vars at the mount:
+Ручной эквивалент:
 
 ```bash
-docker run -i --rm --network host \
-  -v ~/.whisper-models:/models/whisper -v ~/.piper-voices:/models/piper \
-  -e WHISPER_SERVER_MODEL=/models/whisper/ggml-base.en.bin \
-  -e VOICE_PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx \
-  --env-file voice.docker.env ringback
+docker build -t ringback-standalone .
+docker run -d \
+  --name ringback \
+  --restart unless-stopped \
+  --env-file .env \
+  -e WEBRTC_HOST=0.0.0.0 \
+  -p 127.0.0.1:8765:8765 \
+  ringback-standalone
 ```
 
-## Verify the build (offline, no phone)
+## 5. Reverse proxy и TURN
+
+```caddyfile
+voice.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
+```
+
+Публичный URL должен совпадать с `WEBRTC_PUBLIC_URL` и URL меню Mini App. Для надёжного WebRTC между сетями добавьте внешний TURN-сервер в `WEBRTC_ICE_SERVERS_JSON`.
+
+## 6. Проверка
 
 ```bash
-# pjsua2 imports inside the image:
-docker run --rm ringback python -c "import pjsua2; print('pjsua2 OK')"
-
-# whisper + piper present:
-docker run --rm ringback bash -c "whisper-server --help >/dev/null && echo whisper OK; piper --help >/dev/null 2>&1 && echo piper OK"
-
-# full offline suite inside the container (generates fixtures via Piper, runs all tests):
-docker run --rm ringback python tests/run_all.py
+curl http://127.0.0.1:8765/health
+docker compose logs -f ringback
 ```
+
+После изменения `.env` пересоздайте контейнер: `docker compose up -d --force-recreate`.
+
+## Локальный fallback
+
+Стандартный Docker-образ не содержит fallback-модели и не принимает `INSTALL_LOCAL_VOICE` как build arg. Для opt-in локального профиля используйте нативный setup:
+
+```bash
+# macOS
+INSTALL_LOCAL_VOICE=1 ./setup.sh
+
+# Linux / WSL2
+INSTALL_LOCAL_VOICE=1 ./setup-linux.sh
+```
+
+И задайте `VOICE_STT=local`, `VOICE_TTS=piper`.
+
+## Приватность
+
+В облачном профиле каждый завершённый WAV-turn отправляется ElevenLabs Scribe v2, транскрипт и MCP-данные — напрямую OpenAI API, текст ответа — ElevenLabs TTS. Ringback удаляет временный WAV и освобождает RAM-буферы после звонка; постоянный архив не ведётся. Retention у ElevenLabs и OpenAI определяется их текущими условиями и настройками аккаунта.

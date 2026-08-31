@@ -6,26 +6,19 @@ and runs the REAL voice_agent._capture_turn + _wav_snapshot + _transcribe_stream
 (test_voice_listen.py mocked the transcriber, so it never saw this bug). Logs per-poll
 transcript growth so we can SEE where capture drops, then asserts the sentence is caught.
 """
-import importlib.util
 import os
 import re
 import sys
 import tempfile
 import time
-import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+sys.path.insert(0, ROOT)
 from wav_feeder import GrowingWav  # noqa: E402
 
-# --- import voice_agent WITHOUT real pjsua2 (the functions under test don't use it) ---
-pj = types.ModuleType("pjsua2")
-pj.Call = object
-sys.modules["pjsua2"] = pj
-spec = importlib.util.spec_from_file_location("voice_agent", os.path.join(ROOT, "voice_agent.py"))
-va = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(va)
+import voice_agent as va  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 

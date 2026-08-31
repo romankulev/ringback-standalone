@@ -1,4 +1,4 @@
-ringback — ringback-alert / ringback-voice MCP servers
+ringback — standalone Telegram Mini App / WebRTC voice assistant
 Copyright (c) 2026 the project contributors
 
 This product is licensed under the Apache License, Version 2.0 (the "License");
@@ -6,59 +6,43 @@ see the LICENSE file. You may not use this project except in compliance with
 the License.
 
 ================================================================================
-IMPORTANT LICENSING CAVEAT — the voice feature depends on GPL software
-================================================================================
-
-The phone-VOICE component (voice_agent.py, voice_mcp.py) imports **pjsua2**, the
-Python bindings of **PJPROJECT / PJSIP**, which is licensed under
-**GPL-2.0-or-later OR a commercial license** from Teluu Ltd.
-
-Because of this, if you DISTRIBUTE a combined work that links/imports pjsua2,
-that combined work is subject to GPL obligations (or you must obtain a
-commercial pjproject license). The Apache-2.0 license on THIS repository's own
-source does not, and cannot, relax pjproject's GPL terms.
-
-Practical guidance:
-  * Using the voice feature privately for yourself: no problem.
-  * Redistributing a bundle that includes/links pjsua2: comply with the GPL
-    (share source under GPL-compatible terms) OR buy a pjproject commercial
-    license. See https://github.com/pjsip/pjproject and https://www.pjsip.org.
-  * The phone-ALERT component (server.py: ntfy / Pushover / baresip) does NOT
-    depend on pjproject and is unaffected by this caveat.
-
-This is informational, not legal advice. If you plan to redistribute, consult
-the upstream licenses and, if needed, a lawyer.
-
-================================================================================
 THIRD-PARTY COMPONENTS
 ================================================================================
 
-Runtime dependencies (installed by setup.sh / setup-linux.sh / Dockerfile; NOT bundled
-in this repo):
+Runtime dependencies installed by setup.sh, setup-linux.sh, or the Dockerfile
+are not bundled in this repository unless a distribution explicitly says so.
+Each component remains governed by its own license and terms.
 
-  PJPROJECT / pjsua2  — GPL-2.0-or-later OR commercial — https://www.pjsip.org
-      Used by ringback-voice for the SIP call + media engine.
+  aiortc                 — BSD-3-Clause — https://github.com/aiortc/aiortc
+      Python WebRTC/ORTC transport used for encrypted browser audio.
 
-  whisper.cpp         — MIT License — https://github.com/ggerganov/whisper.cpp
-      Used for on-device speech-to-text. Model files (ggml-*.bin) are
-      downloaded from Hugging Face and are not redistributed here.
+  aiohttp                — Apache-2.0 — https://github.com/aio-libs/aiohttp
+      HTTP and WebSocket server for the Telegram Mini App gateway.
 
-  baresip             — BSD-3-Clause — https://github.com/baresip/baresip
-      Used by ringback-alert for the SIP ring + chat message.
+  PyAV                   — BSD-3-Clause — https://github.com/PyAV-Org/PyAV
+      Audio frame conversion between WebRTC and the speech pipeline.
 
-  ntfy                — Apache-2.0 — https://github.com/binwiederhier/ntfy
-      Optional self-hosted push server.
+  whisper.cpp            — MIT — https://github.com/ggerganov/whisper.cpp
+      Optional local speech-to-text fallback. Model files (ggml-*.bin) are
+      downloaded only with INSTALL_LOCAL_VOICE=1 and remain subject to their
+      upstream terms.
 
-  Piper (piper-tts)   — MIT License — https://github.com/rhasspy/piper
-      Default cross-platform neural text-to-speech. Voice models (.onnx) are
-      downloaded from Hugging Face (rhasspy/piper-voices) and not redistributed here.
-  macOS `say`         — Apple system text-to-speech (part of macOS; the macOS fallback).
-  espeak-ng           — GPL-3.0-or-later — https://github.com/espeak-ng/espeak-ng
-      Optional fallback TTS engine on Linux/Windows.
-  ffmpeg              — LGPL/GPL depending on build — https://ffmpeg.org
-      Used to transcode TTS output to the call's audio format.
+  Piper (piper-tts)      — MIT — https://github.com/rhasspy/piper
+      Optional local text-to-speech fallback. Voice models are downloaded only
+      with INSTALL_LOCAL_VOICE=1 from rhasspy/piper-voices on Hugging Face.
 
-  Python: mcp (MIT), httpx (BSD-3-Clause), OpenSSL (Apache-2.0).
+  ffmpeg                 — LGPL/GPL depending on the selected build — https://ffmpeg.org
+      Normalizes synthesized speech before WebRTC delivery.
 
-Each third-party component is the property of its respective owners and is
-governed by its own license. Refer to each project for full terms.
+  espeak-ng              — GPL-3.0-or-later — https://github.com/espeak-ng/espeak-ng
+      Optional fallback used only by the local voice profile.
+
+  Python packages:
+      httpx — BSD-3-Clause; cryptography/OpenSSL and transitive WebRTC
+      dependencies retain their respective upstream licenses.
+
+Telegram Bot API and Mini Apps, OpenAI API, n8n, and ElevenLabs are remote
+services. Their APIs are not redistributed here; use of those services is
+subject to each provider's current terms and account configuration.
+
+This notice is informational and is not legal advice.

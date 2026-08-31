@@ -1,12 +1,7 @@
-"""Voice call engine for ringback-voice: pjsua2 + say (TTS) + whisper.cpp (STT).
+"""Standalone voice engine: Telegram Mini App WebRTC + cloud/local speech.
 
-Provides CallSession: place a SIP call to the Linphone account, then dynamically
-speak() arbitrary text and listen() to the caller (transcribed). The MCP wraps
-this so a Claude session can drive a phone conversation turn by turn.
-
-Run env (set by the launcher):
-  PYTHONPATH   -> pjsua2 build lib dir
-  DYLD_LIBRARY_PATH -> pjproject dylibs + openssl
+``CallSession`` gives the autonomous server a synchronous conversation API,
+while :mod:`webrtc_transport` supplies phone-side media and signaling.
 """
 from __future__ import annotations
 
@@ -23,30 +18,49 @@ import urllib.error
 import urllib.request
 import wave
 
-import pjsua2 as pj
-
 # platform_compat lives next to this file; make it importable no matter how we're
 # loaded (the test harness loads voice_agent.py by path without adding its dir to path).
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
-from platform_compat import IS_MAC, IS_WIN, detached_popen_kwargs, synthesize_to_wav  # noqa: E402
+from platform_compat import (  # noqa: E402
+    IS_MAC,
+    IS_WIN,
+    detached_popen_kwargs,
+    synthesize_to_wav,
+    transcribe_wav_elevenlabs_sync,
+)
+from webrtc_transport import WebRTCTransport  # noqa: E402
 
-# ---- config (all via env; see voice.env.example) ------------------------------
-# Your SIP identity/credentials come from the environment (the launcher sources
-# voice.env). No personal account is baked into this file.
-SIP_ID = os.environ.get("VOICE_SIP_ID", "sip:user@sip.linphone.org")
-SIP_CALLEE = os.environ.get("VOICE_SIP_CALLEE", os.environ.get("VOICE_SIP_ID",
-                                                               "sip:user@sip.linphone.org"))
-SIP_USER = os.environ.get("VOICE_SIP_USER", "user")
-SIP_PASS = os.environ.get("VOICE_SIP_PASS", "")
-SIP_PROXY = os.environ.get("VOICE_SIP_PROXY", "sip:sip.linphone.org;transport=tls")
-# Caller-ID display name shown on the phone (the SIP From header display name).
-SIP_DISPLAY_NAME = os.environ.get("VOICE_DISPLAY_NAME", "").strip()
+# ---- config (all via env; see .env.example) -----------------------------------
 WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper-cli")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL",
-                               os.path.expanduser("~/.whisper-models/ggml-small.en.bin"))
+                               os.path.expanduser("~/.whisper-models/ggml-small.bin"))
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru").strip() or "auto"
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
+
+
+def _stt_engine() -> str:
+    """Return the explicitly selected STT backend.
+
+    ``auto`` intentionally retains the local Whisper behavior so adding an
+    ElevenLabs key for TTS alone cannot begin billable transcription requests.
+    A low-resource server opts into Scribe with ``VOICE_STT=elevenlabs``.
+    """
+    choice = os.environ.get("VOICE_STT", "auto").strip().lower()
+    if choice in ("", "auto", "local", "whisper", "whisper.cpp"):
+        return "local"
+    if choice in ("elevenlabs", "eleven-labs", "scribe"):
+        return "elevenlabs"
+    raise RuntimeError(f"unknown VOICE_STT engine: {choice!r}")
+
+
+def _validated_stt_engine() -> str:
+    """Validate provider credentials before a phone is asked to answer."""
+    engine = _stt_engine()
+    if engine == "elevenlabs" and not os.environ.get("ELEVENLABS_API_KEY", "").strip():
+        raise RuntimeError("VOICE_STT=elevenlabs requires ELEVENLABS_API_KEY")
+    return engine
 
 # Voice-activity thresholds. Background noise was falsely triggering barge-in, so
 # these are now (a) env-tunable and (b) raised at call time by a measured noise floor
@@ -108,15 +122,15 @@ NO_SPEECH_SEC = float(os.environ.get("VOICE_NO_SPEECH_SEC", str(START_TIMEOUT)))
 # Falls back to whisper-cli if it can't start.
 WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER_BIN", "whisper-server")
 WHISPER_SERVER_MODEL = os.environ.get("WHISPER_SERVER_MODEL",
-                                      os.path.expanduser("~/.whisper-models/ggml-base.en.bin"))
+                                      os.path.expanduser("~/.whisper-models/ggml-base.bin"))
 WHISPER_SERVER_HOST = os.environ.get("WHISPER_SERVER_HOST", "127.0.0.1")
 WHISPER_SERVER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8642"))
 WHISPER_SERVER_IDLE_SEC = float(os.environ.get("WHISPER_SERVER_IDLE_SEC", "300"))  # GC after 5 min idle
 
 # ---- silence diagnostics --------------------------------------------------------------
-# Every listen turn ends with ONE summary line on stderr (the stdio MCP's stderr lands in
-# the client's MCP log), so a [SILENCE] result is attributable after the fact:
-#   wav=44B            -> no RTP audio ever arrived (media/network problem, not the user)
+# Every listen turn ends with one diagnostic line on stderr, so a silent result
+# remains attributable after the fact:
+#   wav=44B            -> no WebRTC audio ever arrived (media/network problem, not the user)
 #   rms_max < thresh   -> audio arrived but never crossed the speech-energy threshold
 #   voiced>0 text=0w   -> speech energy was seen but whisper produced no usable words
 # VOICE_DEBUG=1 adds the chatty detail (each transcript the hallucination filter discards).
@@ -147,9 +161,8 @@ def _eff_threshold(base: float, noise_floor: float, factor: float = NOISE_FACTOR
 
 
 def _tts_to_wav(text: str) -> str:
-    """Render text -> 16 kHz mono 16-bit WAV (pjsua2 resamples as needed). Engine is
-    Piper by default, falling back to the OS-native voice; see platform_compat."""
-    wav = tempfile.mktemp(suffix=".wav")
+    """Render text to WAV; the WebRTC transport resamples it to 48 kHz Opus audio."""
+    wav = _temp_path(".wav")
     return synthesize_to_wav(text, wav)
 
 
@@ -159,10 +172,7 @@ def _wav_duration(path: str) -> float:
 
 
 def _wav_snapshot(src: str) -> str:
-    """Rewrite a still-being-recorded WAV with a CORRECT length header so a transcriber
-    sees ALL audio captured so far. An in-progress pjsua recorder leaves the data-size
-    field stale (set at close), so reading it directly yields only a fragment. Returns a
-    temp path (caller removes it) or "" if there's no audio yet."""
+    """Rewrite a growing WAV with a correct header (kept for fixture compatibility)."""
     try:
         with open(src, "rb") as f:
             head = f.read(44)
@@ -176,7 +186,7 @@ def _wav_snapshot(src: str) -> str:
         return ""
     if not pcm or sr == 0:
         return ""
-    dst = tempfile.mktemp(suffix=".wav")
+    dst = _temp_path(".wav")
     with wave.open(dst, "wb") as w:
         w.setnchannels(ch)
         w.setsampwidth(bits // 8)
@@ -190,6 +200,13 @@ def _rm(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _temp_path(suffix: str) -> str:
+    """Reserve a private temporary path without the race inherent in ``mktemp``."""
+    fd, path = tempfile.mkstemp(prefix="ringback-", suffix=suffix)
+    os.close(fd)
+    return path
 
 
 # Whisper emits these bare phrases as HALLUCINATIONS on silence / non-speech audio. If they
@@ -221,8 +238,10 @@ def _clean_text(text: str) -> str:
 
 
 def _transcribe(wav: str) -> str:
-    out = subprocess.run([WHISPER_BIN, "-m", WHISPER_MODEL, "-f", wav, "-nt", "-t", "8"],
-                         capture_output=True, text=True)
+    command = [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", wav, "-nt", "-t", "8"]
+    if WHISPER_LANGUAGE.lower() != "auto":
+        command.extend(["-l", WHISPER_LANGUAGE])
+    out = subprocess.run(command, capture_output=True, text=True)
     if out.returncode != 0:
         _dlog(f"whisper-cli failed (rc={out.returncode}): {out.stderr.strip()[-200:]}")
     return _clean_text(out.stdout)
@@ -251,7 +270,7 @@ def _wsrv_health() -> bool:
 
 def _wsrv_kill_strays():
     """Kill any whisper-server already on our port that ISN'T ours — i.e. an orphan left by
-    a previous (dead) MCP process. POSIX best-effort; called before re-spawning."""
+    a previous dead app process. POSIX best-effort; called before re-spawning."""
     if IS_WIN:
         return
     try:
@@ -306,7 +325,7 @@ def _wsrv_spawn():
     """Start the server if it isn't up (non-blocking) and arm the idle reaper.
 
     The server's lifetime is tied to THIS process: on POSIX it runs under a tiny `sh`
-    watchdog that kills it the moment our PID is gone, so a dead/killed MCP can NEVER leave
+    watchdog that kills it the moment our PID is gone, so a dead app cannot leave
     an orphaned whisper-server. (The previous design detached the server and kept the reaper
     only in the parent — when the parent died, the reaper died with it and the server ran
     forever; observed as a 2.75-day-old orphan with PPID=1.)"""
@@ -314,7 +333,7 @@ def _wsrv_spawn():
     with _wsrv_lock:
         if _wsrv_health() or (_wsrv_proc is not None and _wsrv_proc.poll() is None):
             return
-        _wsrv_kill_strays()   # clear any orphan from a previous dead MCP before re-spawning
+        _wsrv_kill_strays()   # clear an orphan from a previous app run before re-spawning
         try:
             if IS_WIN:
                 _wsrv_proc = subprocess.Popen(
@@ -366,8 +385,18 @@ def _wsrv_ready(wait_sec: float = 12.0) -> bool:
 
 
 def _transcribe_stream(wav: str) -> str:
-    """Fast transcription via the persistent whisper-server; whisper-cli fallback."""
+    """Transcribe through ElevenLabs Scribe or the local persistent Whisper server."""
     global _wsrv_last_use, _wsrv_down_logged
+    if _stt_engine() == "elevenlabs":
+        # The standalone application runs CallSession in its own worker thread, so this
+        # sync adapter never blocks Telegram/WebRTC's asyncio event loop.  The underlying
+        # provider call itself uses httpx.AsyncClient.
+        return _clean_text(
+            transcribe_wav_elevenlabs_sync(
+                wav,
+                language_code=WHISPER_LANGUAGE,
+            )
+        )
     if not _wsrv_ready():
         if not _wsrv_down_logged:
             _dlog("whisper-server not ready -> falling back to whisper-cli (slower)")
@@ -377,11 +406,22 @@ def _transcribe_stream(wav: str) -> str:
         with open(wav, "rb") as f:
             audio = f.read()
         b = "----rbkboundary"
+        fields = (
+            f'\r\n--{b}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\n'
+            'text\r\n'
+        )
+        if WHISPER_LANGUAGE.lower() != "auto":
+            fields += (
+                f'--{b}\r\nContent-Disposition: form-data; name="language"\r\n\r\n'
+                f'{WHISPER_LANGUAGE}\r\n'
+            )
         body = (
             (f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
-             f'Content-Type: audio/wav\r\n\r\n').encode() + audio +
-            (f'\r\n--{b}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\n'
-             f'text\r\n--{b}--\r\n').encode())
+             f'Content-Type: audio/wav\r\n\r\n').encode()
+            + audio
+            + fields.encode()
+            + f'--{b}--\r\n'.encode()
+        )
         req = urllib.request.Request(
             _WSRV_URL + "/inference", data=body,
             headers={"Content-Type": f"multipart/form-data; boundary={b}"})
@@ -402,7 +442,7 @@ def _capture_turn(snapshot_fn, is_disconnected, max_sec: float = 15.0,
                   start_timeout: float = START_TIMEOUT, end_silence: float = END_SILENCE,
                   energy_fn=None, end_rms: float = LISTEN_END_RMS,
                   stats: dict | None = None) -> str:
-    """The streaming capture turn-loop, with NO pjsua2/SIP dependency so it can be
+    """The streaming capture turn-loop, with no signaling/transport dependency so it can be
     unit-tested with a file-fed audio source (see tests/test_capture.py).
 
       snapshot_fn()    -> valid-header WAV path of audio captured so far, or "".
@@ -418,7 +458,8 @@ def _capture_turn(snapshot_fn, is_disconnected, max_sec: float = 15.0,
       - AFTER voice: end `end_silence` after voice stops (energy fell silent AND no new words).
     Energy — not transcript text — drives the endpoint, because whisper re-words the same
     noisy clip every poll (held the turn open ~15s) and word-count plateaus chop real speech.
-    Returns the streamed transcript; the final re-transcribe is the caller's job.
+    Returns the streamed local transcript; with cloud STT it returns ``""`` and the
+    caller sends one final snapshot after endpointing.
     """
     start = time.time()
     text = ""
@@ -428,6 +469,11 @@ def _capture_turn(snapshot_fn, is_disconnected, max_sec: float = 15.0,
     polls = voiced_polls = snaps = 0
     rms_max = 0.0
     exit_reason = "max_sec"
+    # Local Whisper is fast enough to poll a growing recording and can use new words as
+    # an additional voice signal.  Sending the same growing clip to a paid cloud endpoint
+    # three times per second would be slow and costly, so ElevenLabs relies on audio energy
+    # for endpointing and receives exactly one final snapshot in CallSession.listen().
+    poll_transcript = _stt_engine() == "local"
 
     def _fill():
         if stats is not None:
@@ -446,7 +492,8 @@ def _capture_turn(snapshot_fn, is_disconnected, max_sec: float = 15.0,
         rms = energy_fn() if energy_fn is not None else 0.0           # checked every poll
         rms_max = max(rms_max, rms)
         voiced = energy_fn is not None and rms > end_rms
-        if el >= 0.5 and (el - last_check) >= 0.3:                    # transcribe ~3x/sec
+        if poll_transcript and el >= 0.5 and (el - last_check) >= 0.3:
+            # Local transcription only, ~3x/sec.
             last_check = el
             snap = snapshot_fn()
             t = _transcribe_stream(snap) if snap else ""   # already hallucination-filtered
@@ -475,7 +522,7 @@ def _capture_turn(snapshot_fn, is_disconnected, max_sec: float = 15.0,
 
 def _listen_summary(st: dict, wav_bytes: int, result: str, hangup: bool = False) -> None:
     """ONE attributable stderr line per listen turn. The fields disambiguate every cause of
-    a silent turn: wav=44B -> no RTP audio ever arrived; rms_max < thresh -> audio arrived
+    a silent turn: wav=44B -> no WebRTC audio arrived; rms_max < thresh -> audio arrived
     but stayed under the speech threshold; voiced>0 with text=0w -> speech energy was seen
     but whisper produced no usable words (see also the VOICE_DEBUG filter logs)."""
     outcome = ("[CALL ENDED]" if (hangup or st.get("exit") == "hangup")
@@ -531,243 +578,107 @@ def _tail_rms(path: str, seconds: float = 0.25) -> float:
         return 0.0
 
 
-class _Call(pj.Call):
-    def __init__(self, acc, session):
-        super().__init__(acc)
-        self.session = session
-
-    def onCallState(self, prm):
-        ci = self.getInfo()
-        self.session.last_state = ci.state
-        if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
-            self.session.connected = True
-        if ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
-            self.session.connected = False
-            self.session.disconnected = True
-
-    def onCallMediaState(self, prm):
-        ci = self.getInfo()
-        for i, mi in enumerate(ci.media):
-            if (mi.type == pj.PJMEDIA_TYPE_AUDIO
-                    and mi.status == pj.PJSUA_CALL_MEDIA_ACTIVE):
-                self.session.aud = self.getAudioMedia(i)
-
-
 class CallSession:
+    """Conversation engine backed by a Telegram-authenticated WebRTC peer."""
+
     def __init__(self):
-        self.ep = None
-        self.acc = None
-        self.call = None
-        self.aud = None
-        self.connected = False
-        self.disconnected = False
+        self.transport = WebRTCTransport()
         self.last_state = None
         self.noise_floor = 0.0  # ambient RMS measured at call connect (see place_call)
         self.half_duplex = HALF_DUPLEX  # flips on if speaker echo is detected mid-call
-        self.log = []          # unified conversation timeline (claude + user turns)
+        self.log = []          # unified conversation timeline (assistant + user turns)
 
-    def _pump(self, seconds: float):
-        # pjsua2 runs its own worker thread (threadCnt=1) that processes RTP and
-        # events continuously, so we just wait — no manual event pumping needed.
-        time.sleep(seconds)
+    @property
+    def connected(self) -> bool:
+        return self.transport.connected
 
-    def _reg(self):
-        # any thread calling into pjsua2 must be registered (MCP tool calls may
-        # land on different threadpool threads).
-        try:
-            self.ep.libRegisterThread("mcp")
-        except Exception:
-            pass
+    @property
+    def disconnected(self) -> bool:
+        return self.transport.disconnected
 
     def _measure_rms(self, duration: float = 0.6) -> float:
         """Sample ambient audio (right after answer, before anyone speaks) to learn
         the background noise floor, so thresholds can be raised to clear it."""
-        self._reg()
-        if not (self.connected and self.aud):
+        if not self.connected:
             return 0.0
-        wav = tempfile.mktemp(suffix=".wav")
-        try:
-            rec = pj.AudioMediaRecorder()
-            rec.createRecorder(wav)
-            self.aud.startTransmit(rec)
-            time.sleep(duration)
-            try:
-                self.aud.stopTransmit(rec)
-            except Exception:
-                pass
-            del rec
-            return _tail_rms(wav, seconds=duration)
-        except Exception:
-            return 0.0
-        finally:
-            _rm(wav)
+        cursor = self.transport.capture_cursor()
+        time.sleep(duration)
+        return self.transport.tail_rms(cursor, seconds=duration)
 
     def start_lib(self):
-        self.ep = pj.Endpoint()
-        self.ep.libCreate()
-        cfg = pj.EpConfig()
-        cfg.uaConfig.threadCnt = 1          # worker thread keeps the call alive
-        # quiet by default; raise VOICE_CONSOLE_LEVEL (e.g. 5) to see SIP signaling, or set
-        # VOICE_LOG_FILE to capture full pjsua logs to a file for debugging
-        cfg.logConfig.level = int(os.environ.get("VOICE_LOG_LEVEL", "1"))
-        cfg.logConfig.consoleLevel = int(os.environ.get("VOICE_CONSOLE_LEVEL", "0"))
-        _logfile = os.environ.get("VOICE_LOG_FILE", "")
-        if _logfile:
-            cfg.logConfig.filename = _logfile
-        # STUN: discover our PUBLIC RTP address so the SDP advertises something the remote
-        # media server can actually return audio to. Without it, a client behind NAT (notably
-        # inside Docker — bridge or Docker Desktop) advertises a private address and gets
-        # ONE-WAY audio (it hears the user fine, the user's reply never arrives). Off unless
-        # VOICE_STUN is set; the Docker plugin sets it (the local/native path doesn't need it).
-        _stun = os.environ.get("VOICE_STUN", "").strip()
-        if _stun:
-            cfg.uaConfig.stunServer.append(_stun)
-            print(f"[ringback] STUN enabled: {_stun}", file=sys.stderr, flush=True)
-        self.ep.libInit(cfg)
-
-        self.ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, pj.TransportConfig())
-        tls = pj.TransportConfig()
-        tls.tlsConfig.verifyServer = False
-        tls.tlsConfig.method = pj.PJSIP_TLSV1_2_METHOD
-        self.ep.transportCreate(pj.PJSIP_TRANSPORT_TLS, tls)
-        self.ep.libStart()
-        # We never use the local sound card — all media is file<->call(RTP). On headless
-        # Linux / containers we force a NULL audio device so pjsua2 never needs a real one
-        # (this is what lets the engine run fully headless). On macOS we KEEP the existing,
-        # known-good behavior by default so nothing regresses; set VOICE_NULL_AUDIO=1 to
-        # force null there too, or =0 to disable everywhere.
-        _null = os.environ.get("VOICE_NULL_AUDIO", "auto").strip().lower()
-        if _null in ("1", "true", "yes") or (_null == "auto" and not IS_MAC):
-            try:
-                self.ep.audDevManager().setNullDev()
-            except Exception as e:
-                # A headless-audio misconfig must not hide behind a green init — surface it
-                # on stderr (stdout is the MCP transport). Non-fatal: pjsua may still cope.
-                print(f"[ringback] setNullDev() failed: {e}", file=sys.stderr)
-
-        acfg = pj.AccountConfig()
-        # add the caller-ID display name to the From header if configured
-        acfg.idUri = f'"{SIP_DISPLAY_NAME}" <{SIP_ID}>' if SIP_DISPLAY_NAME else SIP_ID
-        acfg.regConfig.registrarUri = ""    # do NOT register (avoids self-call fork)
-        acfg.sipConfig.authCreds.append(
-            pj.AuthCredInfo("digest", "*", SIP_USER, 0, SIP_PASS))
-        acfg.sipConfig.proxies.append(SIP_PROXY)
-        acfg.mediaConfig.srtpUse = pj.PJMEDIA_SRTP_MANDATORY
-        acfg.mediaConfig.srtpSecureSignaling = 0
-        # RTP media port base. Default (0) keeps pjsua's 4000; override (VOICE_RTP_PORT) when
-        # a second instance must coexist with the running MCP server (which holds 4000/4002).
-        rtp_port = int(os.environ.get("VOICE_RTP_PORT", "0"))
-        if rtp_port:
-            acfg.mediaConfig.transportConfig.port = rtp_port
-        self.acc = pj.Account()
-        self.acc.create(acfg)
+        self.transport.start()
 
     def place_call(self, answer_timeout: float = 25.0, callee: str | None = None) -> bool:
-        # `callee` lets a caller dial a specific SIP address (the remote/multi-user server
-        # passes each user's Linphone address); defaults to env SIP_CALLEE (local self-call),
-        # so the local stdio MCP is unchanged.
-        import gc
-        self._reg()
-        self.connected = False
-        self.disconnected = False
+        """Notify the configured Telegram user and wait for their Mini App to answer."""
+        # Conversation text is transient call state.  Never carry a previous caller's
+        # transcript into a later session, including when the previous call failed.
+        self.log.clear()
+        stt = _validated_stt_engine()
         self.half_duplex = HALF_DUPLEX   # re-evaluate echo per call (unless forced on)
-        self.aud = None
-        if self.call is not None:        # clear any previous call object
-            self.call = None
-            gc.collect()
-        self.call = _Call(self.acc, self)
-        self.call.makeCall(callee or SIP_CALLEE, pj.CallOpParam(True))
-        end = time.time() + answer_timeout
-        while time.time() < end:
-            time.sleep(0.1)
-            if self.connected and self.aud is not None:
-                time.sleep(0.4)   # let media settle
-                self.noise_floor = self._measure_rms(0.6)   # calibrate to ambient noise
-                _dlog("call connected: noise_floor=%.0f -> listen_thresh=%.0f "
-                      "barge_thresh=%.0f end_rms=%.0f"
-                      % (self.noise_floor,
-                         _eff_threshold(LISTEN_RMS_BASE, self.noise_floor, LISTEN_NOISE_FACTOR),
-                         _eff_threshold(BARGE_RMS_BASE, self.noise_floor), LISTEN_END_RMS))
-                _wsrv_warm()   # lazily start the whisper-server now so it's ready to capture
-                return True
-            if self.disconnected:
-                return False
-        return False
+        if not self.transport.place_call(answer_timeout=answer_timeout, callee=callee):
+            self.last_state = self.transport.reason or "no answer"
+            return False
+        time.sleep(0.25)   # allow the microphone stream to settle before calibration
+        self.noise_floor = self._measure_rms(0.6)
+        self.last_state = "connected"
+        _dlog("WebRTC call connected: noise_floor=%.0f -> listen_thresh=%.0f "
+              "barge_thresh=%.0f end_rms=%.0f"
+              % (self.noise_floor,
+                 _eff_threshold(LISTEN_RMS_BASE, self.noise_floor, LISTEN_NOISE_FACTOR),
+                 _eff_threshold(BARGE_RMS_BASE, self.noise_floor), LISTEN_END_RMS))
+        if stt == "local":
+            _wsrv_warm()
+        return True
 
     def speak(self, text: str):
-        self._reg()
-        if not (self.connected and self.aud):
+        if not self.connected:
             return "not connected"
         wav = _tts_to_wav(text)
-        dur = _wav_duration(wav)
-        player = pj.AudioMediaPlayer()
-        player.createPlayer(wav, pj.PJMEDIA_FILE_NO_LOOP)
-        player.startTransmit(self.aud)
-        end = time.time() + dur + 0.3
-        while time.time() < end:        # poll so a hang-up stops us AT ONCE, not after the whole line
-            time.sleep(0.05)
-            if self.disconnected:
-                break
         try:
-            player.stopTransmit(self.aud)
-        except Exception:
-            pass
-        del player
-        _rm(wav)
+            duration = self.transport.play_wav(wav)
+            self.transport.wait_playback(duration + 2.0)
+        finally:
+            _rm(wav)
         return "ended" if self.disconnected else "spoke"
 
     def listen(self, max_sec: float = 15.0, end_silence: float = END_SILENCE,
-               start_timeout: float = START_TIMEOUT) -> str:
-        """Capture one user turn, STREAMED through the persistent whisper-server. Records
-        and transcribes the growing clip ~3x/sec; the turn-end logic lives in the pure,
-        file-testable _capture_turn (two-phase: wait `start_timeout` for the first word,
-        then end `end_silence` after the last). No "your turn" beep — they just hear us
-        finish and reply, like a real call. Returns the user's words, or "" on silence /
-        hang-up (caller surfaces [SILENCE] / [CALL ENDED])."""
-        self._reg()
-        if not (self.connected and self.aud):
+               start_timeout: float = START_TIMEOUT, start_cursor: int | None = None) -> str:
+        """Capture and transcribe one user turn.
+
+        Audio energy supplies the two-phase endpoint (wait ``start_timeout`` for speech,
+        then ``end_silence`` after it stops). Local Whisper may inspect the growing clip;
+        ElevenLabs receives one completed snapshot. No turn beep is needed. Returns the
+        user's words, or ``""`` on silence/hang-up.
+        """
+        if not self.connected:
             _dlog("listen: no active media (connected=%s, disconnected=%s) -> [SILENCE]"
                   % (self.connected, self.disconnected))
             return ""
-        rec_wav = tempfile.mktemp(suffix=".wav")
-        rec = pj.AudioMediaRecorder()
-        rec.createRecorder(rec_wav)
-        self.aud.startTransmit(rec)
-        # stream-capture via the pure, file-fed turn-loop (same code the tests exercise);
-        # energy_fn = near-end tail RMS is the robust "still talking?" signal for end-of-turn
+        cursor = self.transport.capture_cursor() if start_cursor is None else start_cursor
         st: dict = {}
-        text = _capture_turn(lambda: _wav_snapshot(rec_wav), lambda: self.disconnected,
+        text = _capture_turn(lambda: self.transport.capture_snapshot(cursor),
+                             lambda: self.disconnected,
                              max_sec=max_sec, start_timeout=start_timeout, end_silence=end_silence,
-                             energy_fn=lambda: _tail_rms(rec_wav, 0.3), stats=st)
-        try:
-            self.aud.stopTransmit(rec)
-        except Exception:
-            pass
-        del rec
-        try:
-            wav_bytes = os.path.getsize(rec_wav)   # 44B = header only -> NO RTP ever arrived
-        except OSError:
-            wav_bytes = 0
+                             energy_fn=lambda: self.transport.tail_rms(cursor, 0.3), stats=st)
+        pcm_bytes = self.transport.captured_bytes(cursor)
+        wav_bytes = pcm_bytes + 44 if pcm_bytes else 0
         if text is None or self.disconnected:    # hang-up mid-turn
             _listen_summary(st, wav_bytes, "", hangup=True)
-            _rm(rec_wav)
             return ""
-        snap = _wav_snapshot(rec_wav)            # full audio with a correct header
+        snap = self.transport.capture_snapshot(cursor)
         final = _transcribe_stream(snap) if snap else ""
-        if snap:
-            _rm(snap)
         result = final or text
         _listen_summary(st, wav_bytes, result)
-        if not result and DEBUG_KEEP_WAV:        # keep the audio of a silent turn for replay
+        if snap and not result and DEBUG_KEEP_WAV:
             try:
                 os.makedirs(DEBUG_WAV_DIR, exist_ok=True)
                 kept = os.path.join(DEBUG_WAV_DIR, "turn-%d.wav" % int(time.time()))
-                os.replace(rec_wav, kept)
+                os.replace(snap, kept)
                 _dlog(f"listen: silent-turn audio kept at {kept}")
             except OSError:
-                _rm(rec_wav)
-        else:
-            _rm(rec_wav)
+                _rm(snap)
+        elif snap:
+            _rm(snap)
         return result
 
     def speak_interruptible(self, text: str, listen_after: bool = True,
@@ -783,11 +694,10 @@ class CallSession:
         If the call is in half-duplex (speaker echo detected, or VOICE_HALF_DUPLEX),
         barge-in is skipped: we speak fully, drain the echo tail, then listen.
         """
-        self._reg()
         _t0 = time.time()
         _tlog = ((lambda m: print("[timing] +%5.2fs %s" % (time.time() - _t0, m), flush=True))
                  if os.environ.get("VOICE_TIMING") else (lambda m: None))
-        if not (self.connected and self.aud):
+        if not self.connected:
             return {"ok": False, "ended": self.disconnected, "user": "",
                     "interrupted": False, "spoken": "", "unsaid": ""}
 
@@ -796,49 +706,44 @@ class CallSession:
             # back off the user's speaker would trigger it). Speak fully, then listen.
             self.speak(text)
             if self.disconnected:
-                self.log.append({"who": "claude", "text": text, "interrupted": False, "unsaid": ""})
+                self.log.append({"who": "assistant", "text": text, "interrupted": False, "unsaid": ""})
                 return {"ok": True, "ended": True, "interrupted": False,
                         "spoken": text, "unsaid": "", "user": ""}
             user_text = ""
             if listen_after:
                 time.sleep(POST_SPEAK_DRAIN)   # let the echo of our last words die down
                 user_text = self.listen(max_sec=max_wait)
-            self.log.append({"who": "claude", "text": text, "interrupted": False, "unsaid": ""})
+            self.log.append({"who": "assistant", "text": text, "interrupted": False, "unsaid": ""})
             if user_text:
                 self.log.append({"who": "user", "text": user_text})
             return {"ok": True, "interrupted": False, "spoken": text, "unsaid": "",
                     "user": user_text, "ended": self.disconnected}
 
         wav = _tts_to_wav(text)
-        dur = _wav_duration(wav)
+        cursor = self.transport.capture_cursor()
+        dur = self.transport.play_wav(wav)
         _tlog("TTS generated (%.1fs of audio to speak)" % dur)
-
-        # --- phase 1: speak while a throwaway recorder senses barge-in ---
-        det_wav = tempfile.mktemp(suffix=".wav")
-        det = pj.AudioMediaRecorder()
-        det.createRecorder(det_wav)
-        self.aud.startTransmit(det)
-        player = pj.AudioMediaPlayer()
-        player.createPlayer(wav, pj.PJMEDIA_FILE_NO_LOOP)
-        player.startTransmit(self.aud)
         start = time.time()
-        interrupted_at = None
+        interrupted_at: float | None = None
+        interrupted_fraction: float | None = None
         echo_mode = False
         # Barge threshold from the DURING-TX floor, not the pre-call noise floor: let our
         # TTS establish briefly, measure the near-end level while the user is still
         # listening, and key off that. Phone-side AEC keeps it low (~hundreds) so a real
         # barge (thousands) clears it; an echoey device pushes it up and trips the echo guard.
         time.sleep(0.4)
-        tx_floor = 0.0 if self.disconnected else _tail_rms(det_wav, 0.3)
+        tx_floor = 0.0 if self.disconnected else self.transport.tail_rms(cursor, 0.3)
         barge_thresh = min(max(BARGE_RMS_MIN, tx_floor * 2.0), RMS_CAP)
         barge = _BargeState(barge_thresh)
         while time.time() - start < dur + 0.2:
             time.sleep(0.08)
             if self.disconnected:
                 break
+            if self.transport.playback_progress() >= 1.0:
+                break
             if echo_mode:
                 continue                            # echo detected: just finish speaking
-            verdict = barge.feed(time.time() - start, _tail_rms(det_wav))
+            verdict = barge.feed(time.time() - start, self.transport.tail_rms(cursor, 0.25))
             if verdict == "echo":
                 # too early to be a real interruption — almost certainly our own voice
                 # echoing off a speaker (no phone AEC). Don't cut off; finish this line and
@@ -847,18 +752,12 @@ class CallSession:
                 self.half_duplex = True
             elif verdict == "barge":
                 interrupted_at = time.time() - start
+                interrupted_fraction = self.transport.playback_progress()
                 break
-        try:
-            player.stopTransmit(self.aud)
-        except Exception:
-            pass
-        del player
-        try:
-            self.aud.stopTransmit(det)
-        except Exception:
-            pass
-        del det
-        _rm(det_wav)
+        if interrupted_at is not None or self.disconnected:
+            self.transport.stop_playback()
+        else:
+            self.transport.wait_playback(1.0)
 
         # user hung up mid-speech -> stop instantly, no transcription
         if self.disconnected:
@@ -870,7 +769,8 @@ class CallSession:
         _tlog("speech phase done (interrupted=%s)" % interrupted)
         words = text.split()
         if interrupted:
-            frac = min(1.0, interrupted_at / max(dur, 0.1))
+            frac = min(1.0, interrupted_fraction if interrupted_fraction is not None
+                       else interrupted_at / max(dur, 0.1))
             k = max(1, int(round(len(words) * frac)))
             spoken, unsaid = " ".join(words[:k]), " ".join(words[k:])
         else:
@@ -883,14 +783,16 @@ class CallSession:
             # as a normal reply (whisper-server, ends ~END_SILENCE after they stop). This
             # used to record the whole interruption then transcribe it ONCE with slow
             # whisper-cli, which made post-barge replies take ~20s on a real call.
-            user_text = self.listen(max_sec=max_wait)
+            # Keep the pre-roll from the start of playback so Whisper does not lose the
+            # first word that triggered barge-in.
+            user_text = self.listen(max_sec=max_wait, start_cursor=cursor)
         elif listen_after:
             # normal turn: robust whisper-driven listen (two-phase start/endpoint timing)
             user_text = self.listen(max_sec=max_wait)
         _tlog("capture/listen done -> %r (total converse engine time)" % (user_text[:40]))
 
         _rm(wav)
-        self.log.append({"who": "claude", "text": spoken,
+        self.log.append({"who": "assistant", "text": spoken,
                          "interrupted": interrupted, "unsaid": unsaid})
         if user_text:
             self.log.append({"who": "user", "text": user_text})
@@ -898,31 +800,19 @@ class CallSession:
                 "unsaid": unsaid, "user": user_text, "ended": self.disconnected}
 
     def hangup(self):
-        self._reg()
-        try:
-            if self.call:
-                self.call.hangup(pj.CallOpParam(True))
-                time.sleep(0.5)
-        except Exception:
-            pass
-        self.connected = False
+        self.transport.hangup()
+        self.last_state = self.transport.reason or "ended"
+        self.log.clear()
 
     def shutdown(self):
-        import gc
         try:
             self.hangup()
         except Exception:
             pass
-        # destroy Call/Account C++ objects BEFORE libDestroy (else pjsua asserts)
-        self.call = None
-        self.aud = None
-        self.acc = None
-        gc.collect()
-        try:
-            self.ep.libDestroy()
-        except Exception:
-            pass
-        self.ep = None
+        self.transport.shutdown()
+
+    def status(self) -> str:
+        return self.transport.status()
 
 
 if __name__ == "__main__":

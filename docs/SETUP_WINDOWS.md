@@ -1,56 +1,70 @@
-# Ringback — Windows Setup
+# Установка Ringback Standalone на Windows
 
-The voice engine depends on **pjsua2** (pjproject's Python bindings). Building those
-natively on Windows means Visual Studio + SWIG + hand-managed OpenSSL — fragile and
-unsupported here. Instead, run the **Linux build** on Windows. Two supported routes:
+Для Windows поддерживаются два практичных варианта: WSL2 и Docker Desktop. Облачный профиль ElevenLabs Scribe v2 + TTS не требует локальных AI-моделей. Нативный Windows-запуск всё равно не рекомендуется для серверного развёртывания.
 
-## Recommended: WSL2
+## WSL2
 
-WSL2 is a real Linux kernel on Windows; everything in [SETUP_LINUX.md](SETUP_LINUX.md)
-works inside it, and Linux host networking makes SIP/RTP "just work".
+В PowerShell от администра:
 
 ```powershell
-# 1. Install WSL2 (PowerShell as admin), then reboot if prompted:
 wsl --install -d Ubuntu
 ```
 
-```bash
-# 2. Inside the Ubuntu (WSL) shell:
-git clone <your-fork-or-this-repo> ringback && cd ringback
-./setup-linux.sh
-$EDITOR voice.env        # VOICE_SIP_ID, VOICE_SIP_USER, VOICE_SIP_PASS
+После перезагрузки откройте Ubuntu и выполните:
 
-# 3. Register the MCP server using the WSL python + launcher.
-#    If your MCP client runs on the Windows side, point it at the WSL interpreter:
-#      wsl python3 /home/<you>/ringback/run_voice_mcp.py
-#    If the client runs inside WSL, just:
-claude mcp add ringback-voice --scope user -- python3 "$PWD/run_voice_mcp.py"
+```bash
+cd /path/to/ringback
+./setup-linux.sh
 ```
 
-Microphone/speaker are irrelevant (the engine is headless — all audio is WAV ↔ SIP/RTP),
-so WSL2's limited audio support is a non-issue.
+Заполните `.env`. Обязательны прямой OpenAI key, ElevenLabs API key/voice ID, HTTPS Mini App URL и опубликованный n8n MCP production URL. OpenAI key возьмите из защищённой конфигурации проекта «ИИ телефония»:
 
-## Alternative: Docker Desktop
+```dotenv
+OPENAI_API_KEY="..."
+OPENAI_MODEL="gpt-5.6-luna"
+OPENAI_BASE_URL="https://api.openai.com/v1/chat/completions"
+```
 
-Use the prebuilt container — see [SETUP_DOCKER.md](SETUP_DOCKER.md). One caveat: Docker
-Desktop runs in a VM, so RTP media needs an explicit published UDP port:
+[Официальная карточка GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) подтверждает Chat Completions и function calling, так что Responses API для этой реализации не обязателен. Внешний n8n принимается только с HTTPS + Bearer/custom-header авторизацией; legacy URL отвечает без такой защиты и поэтому отклоняется.
+
+Затем запустите pairing первый раз:
+
+```bash
+.venv/bin/python configure_telegram.py discover --write
+```
+
+Он покажет одноразовую `/start <код>` и завершится с кодом 2. Отправьте боту точно эту команду и повторите:
+
+```bash
+.venv/bin/python configure_telegram.py discover --write
+.venv/bin/python configure_telegram.py configure
+./run_app.sh --check
+./run_app.sh
+```
+
+Второй запуск запишет Telegram ID и ротирует код. Обычный `/start` без кода не привязывает аккаунт.
+
+Для опционального локального fallback в WSL2 запустите `INSTALL_LOCAL_VOICE=1 ./setup-linux.sh`, затем задайте `VOICE_STT=local` и `VOICE_TTS=piper`.
+
+При постоянном хостинге лучше перенести ту же конфигурацию на Linux VPS: WSL2 зависит от запущенного Windows-компьютера.
+
+## Docker Desktop
+
+Стандартный образ лёгкий: в нём нет whisper.cpp, Piper и локальных моделей. Перед запуском пройдите защищённый Telegram pairing по командам из [Docker-инструкции](SETUP_DOCKER.md).
 
 ```powershell
-docker build -t ringback .
-docker run -i --rm -e VOICE_RTP_PORT=4000 -p 4000:4000/udp -p 4001:4001/udp `
-  --env-file voice.docker.env ringback
+docker build -t ringback-standalone .
+docker run -d --name ringback --restart unless-stopped `
+  --env-file .env `
+  -e WEBRTC_HOST=0.0.0.0 `
+  -p 127.0.0.1:8765:8765 `
+  ringback-standalone
 ```
 
-(`voice.docker.env` is the plain `KEY=val` form of your creds — see the conversion step in
-[SETUP_DOCKER.md](SETUP_DOCKER.md), since `docker --env-file` can't read `voice.env`'s
-`export` syntax.) This port mapping tested working with two-way audio on Docker Desktop for
-Mac; if a connected call has no audio on your network, prefer WSL2, where host networking
-avoids RTP/NAT entirely.
+Проверьте `http://127.0.0.1:8765/health`, затем опубликуйте его через HTTPS reverse proxy или защищённый туннель. Для мобильных сетей нужен внешний TURN-сервер; публикация TCP-порта 8765 его не заменяет.
 
-## Not supported: native Windows build
+Полный Docker-процесс: [SETUP_DOCKER.md](SETUP_DOCKER.md).
 
-A native MSVC/SWIG pjsua2 build is intentionally not documented — it's brittle and offers
-no benefit here, since the engine is headless and runs identically under WSL2/Docker. The
-pure-Python pieces (`platform_compat.py`, the turn/capture logic) do include Windows
-support (`GetLastInputInfo` idle detection, detached-process flags, SAPI TTS) so that a
-future native port is possible, but pjsua2 remains the blocker we route around.
+## Приватность
+
+В облачном профиле WAV реплики передаётся ElevenLabs Scribe v2, транскрипт и MCP-данные — напрямую OpenAI API, текст ответа — ElevenLabs TTS. Ringback удаляет временный WAV и освобождает RAM-буферы, но retention на стороне ElevenLabs и OpenAI определяется их условиями и настройками.

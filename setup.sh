@@ -1,143 +1,139 @@
-#!/bin/bash
-# setup.sh — one-shot installer for ringback-alert / ringback-voice on macOS.
-#
-# Installs the toolchain, compiles pjproject + the pjsua2 Python bindings from
-# source (no Homebrew formula provides them), downloads a whisper model, and
-# installs the Python deps. Safe to re-run; it skips steps already done.
-#
-# macOS only: the voice feature uses Apple `say` (TTS) and CoreAudio.
-#
-# Thanks to the teammate who debugged the macOS sharp edges end-to-end (the
-# make-target, -std=c++11, OpenSSL flat-namespace, and missing-model issues) —
-# see docs/SETUP_MACOS.md for the full root-cause writeup + symptom→fix table.
+#!/usr/bin/env bash
+# One-shot macOS setup for the standalone Telegram Mini App + WebRTC server.
+# Safe to re-run: the virtual environment and downloaded models are reused.
 set -euo pipefail
 
-APP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PJ_VER="${PJ_VER:-2.17}"
-PJPROJECT_DIR="${PJPROJECT_DIR:-$HOME/build/pjproject-$PJ_VER}"
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
-WHISPER_MODEL_NAME="${WHISPER_MODEL_NAME:-ggml-small.en.bin}"
-MODEL_DIR="$HOME/.whisper-models"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+VENV_DIR="${VENV_DIR:-$APP_DIR/.venv}"
+VENV_PY="$VENV_DIR/bin/python"
+WHISPER_MODEL_DIR="${WHISPER_MODEL_DIR:-$HOME/.whisper-models}"
+PIPER_DIR="${PIPER_DIR:-$HOME/.piper-voices}"
+PIPER_VOICE="${PIPER_VOICE:-ru_RU-irina-medium}"
+INSTALL_LOCAL_VOICE="${INSTALL_LOCAL_VOICE:-0}"
 
 say_step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 
-[ "$(uname)" = "Darwin" ] || { echo "This setup targets macOS only."; exit 1; }
-command -v brew >/dev/null || { echo "Homebrew required: https://brew.sh"; exit 1; }
-[ -n "$PYTHON_BIN" ] || { echo "python3 not found on PATH"; exit 1; }
+download_model() {
+  local url="$1" destination="$2" minimum_bytes="$3"
+  local partial="${destination}.part" current_size=0 partial_size=0
 
-say_step "1/6 Installing Homebrew packages (swig, openssl@3, opus, sdl2, ffmpeg, whisper-cpp, baresip, uv)"
-# opus + sdl2 are pjproject media deps also needed if you run fix_macos_twolevel.sh.
-# uv runs the ringback-alert server (uv run server.py); the rest are voice deps.
-brew install swig openssl@3 opus sdl2 ffmpeg whisper-cpp baresip uv
+  if [ -f "$destination" ]; then
+    current_size="$(wc -c < "$destination" | tr -d ' ')"
+    if [ "$current_size" -ge "$minimum_bytes" ]; then
+      return 0
+    fi
 
-OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+    echo "  найден неполный $(basename "$destination"), продолжаю загрузку ..."
+    if [ -f "$partial" ]; then
+      partial_size="$(wc -c < "$partial" | tr -d ' ')"
+    fi
+    if [ "$current_size" -gt "$partial_size" ]; then
+      mv "$destination" "$partial"
+    fi
+  fi
 
-say_step "2/6 Fetching pjproject $PJ_VER source -> $PJPROJECT_DIR"
-mkdir -p "$(dirname "$PJPROJECT_DIR")"
-if [ ! -d "$PJPROJECT_DIR" ]; then
-  curl -fsSL "https://github.com/pjsip/pjproject/archive/refs/tags/$PJ_VER.tar.gz" \
-    -o "/tmp/pjproject-$PJ_VER.tar.gz"
-  tar xzf "/tmp/pjproject-$PJ_VER.tar.gz" -C "$(dirname "$PJPROJECT_DIR")"
+  curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+    --connect-timeout 30 --progress-bar -C - "$url" -o "$partial"
+
+  current_size="$(wc -c < "$partial" | tr -d ' ')"
+  if [ "$current_size" -lt "$minimum_bytes" ]; then
+    echo "Загрузка $(basename "$destination") не завершена ($current_size байт)." >&2
+    return 1
+  fi
+  mv "$partial" "$destination"
+}
+
+[ "$(uname)" = "Darwin" ] || {
+  echo "Этот установщик предназначен для macOS. На сервере Linux используйте setup-linux.sh." >&2
+  exit 1
+}
+command -v brew >/dev/null 2>&1 || {
+  echo "Нужен Homebrew: https://brew.sh" >&2
+  exit 1
+}
+[ -n "$PYTHON_BIN" ] || {
+  echo "Не найден python3." >&2
+  exit 1
+}
+
+local_voice_enabled() {
+  case "$(printf '%s' "$INSTALL_LOCAL_VOICE" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+say_step "1/4 — системные зависимости"
+brew install ffmpeg
+if local_voice_enabled; then
+  brew install whisper-cpp
 fi
 
-say_step "3/6 Configuring + compiling pjproject (with OpenSSL for TLS/SRTP)"
-cd "$PJPROJECT_DIR"
-export CFLAGS="-I$OPENSSL_PREFIX/include -fPIC -O2"
-export LDFLAGS="-L$OPENSSL_PREFIX/lib"
-if [ ! -f "pjlib/lib/libpj.dylib" ]; then
-  ./configure --enable-shared --with-ssl="$OPENSSL_PREFIX"
-  make dep
-  make
+say_step "2/4 — Python-окружение"
+if [ ! -x "$VENV_PY" ]; then
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
+"$VENV_PY" -m pip install --quiet --upgrade pip setuptools wheel
+"$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt"
 
-say_step "4/6 Building pjsua2 Python bindings (for $("$PYTHON_BIN" --version))"
-cd "$PJPROJECT_DIR/pjsip-apps/src/swig/python"
-if ! ls build/lib.*/_pjsua2*.so >/dev/null 2>&1; then
-  # pjproject 2.17's bindings build via the default 'all' target — NOT `make python`
-  # (there is no `python` target; `make python` aborts the whole script under set -e,
-  # which then skips the whisper download + voice.env creation below).
-  # -std=c++11 is REQUIRED or the SWIG-generated C++ fails on rvalue refs / nullptr.
-  CFLAGS="-std=c++11 -I$OPENSSL_PREFIX/include -fPIC -O2" \
-  CXXFLAGS="-std=c++11 -I$OPENSSL_PREFIX/include -fPIC -O2" \
-  PATH="$(dirname "$PYTHON_BIN"):$PATH" \
-    make
-fi
+say_step "3/4 — голосовой профиль"
+if local_voice_enabled; then
+  mkdir -p "$WHISPER_MODEL_DIR"
+  download_model \
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin" \
+    "$WHISPER_MODEL_DIR/ggml-base.bin" 140000000
+  download_model \
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin" \
+    "$WHISPER_MODEL_DIR/ggml-small.bin" 470000000
 
-say_step "5/6 Downloading whisper model ($WHISPER_MODEL_NAME)"
-mkdir -p "$MODEL_DIR"
-if [ ! -f "$MODEL_DIR/$WHISPER_MODEL_NAME" ]; then
-  echo "  (~470 MB for small.en — this can take a minute)"
-  curl -fL --progress-bar "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$WHISPER_MODEL_NAME" \
-    -o "$MODEL_DIR/$WHISPER_MODEL_NAME"
-fi
-# fail loudly if the model isn't there — without it, calls connect but every reply
-# transcribes as [SILENCE]/[unclear].
-[ -f "$MODEL_DIR/$WHISPER_MODEL_NAME" ] \
-  || { echo "ERROR: whisper model missing at $MODEL_DIR/$WHISPER_MODEL_NAME"; exit 1; }
-
-# --- Piper neural TTS (the cross-platform default voice) — BEST EFFORT ----------
-# Piper is the default TTS everywhere. On macOS, if it can't install (e.g. no onnxruntime
-# wheel for your Python), that's fine: the engine auto-falls back to `say`, so this step
-# never blocks setup and your existing macOS behavior is preserved.
-say_step "5b/6 Installing Piper TTS + voice (best-effort; falls back to macOS 'say')"
-PIPER_DIR="$HOME/.piper-voices"; PIPER_VOICE="en_US-lessac-medium"
-mkdir -p "$PIPER_DIR"
-if "$PYTHON_BIN" -m pip install --quiet piper-tts 2>/dev/null \
-   || "$PYTHON_BIN" -m pip install --quiet --break-system-packages piper-tts 2>/dev/null; then
-  PV="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium"
-  for f in "$PIPER_VOICE.onnx" "$PIPER_VOICE.onnx.json"; do
-    [ -f "$PIPER_DIR/$f" ] || curl -fL --progress-bar "$PV/$f" -o "$PIPER_DIR/$f" || true
-  done
-  echo "  Piper installed (voice: $PIPER_DIR/$PIPER_VOICE.onnx). Force the macOS voice with VOICE_TTS=say."
+  mkdir -p "$PIPER_DIR"
+  "$VENV_PY" -m pip install --quiet piper-tts==1.7.0
+  piper_base="https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium"
+  download_model "$piper_base/$PIPER_VOICE.onnx" \
+    "$PIPER_DIR/$PIPER_VOICE.onnx" 50000000
+  download_model "$piper_base/$PIPER_VOICE.onnx.json" \
+    "$PIPER_DIR/$PIPER_VOICE.onnx.json" 1000
 else
-  echo "  Piper not installed — using macOS 'say' (totally fine). Re-run later to add it."
+  echo "  Облачный профиль ElevenLabs: локальные AI-модели не устанавливаются."
 fi
 
-say_step "6/6 Installing Python deps (mcp, httpx) into $PYTHON_BIN"
-# (--break-system-packages fallback for Homebrew/PEP-668 "externally-managed" pythons)
-"$PYTHON_BIN" -m pip install --quiet "mcp>=1.2.0" httpx \
-  || "$PYTHON_BIN" -m pip install --quiet --break-system-packages "mcp>=1.2.0" httpx
-
-# quick sanity import of pjsua2 under the resolved env
-SWIG_LIB="$(ls -d "$PJPROJECT_DIR"/pjsip-apps/src/swig/python/build/lib.* | head -1)"
-PYTHONPATH="$SWIG_LIB" \
-DYLD_LIBRARY_PATH="$PJPROJECT_DIR/pjlib/lib:$PJPROJECT_DIR/pjlib-util/lib:$PJPROJECT_DIR/pjnath/lib:$PJPROJECT_DIR/pjmedia/lib:$PJPROJECT_DIR/pjsip/lib:$PJPROJECT_DIR/third_party/lib:$OPENSSL_PREFIX/lib" \
-  "$PYTHON_BIN" -c "import pjsua2; print('pjsua2 import OK')"
-
-# create voice.env from the template if it doesn't exist yet (you fill in creds)
-if [ ! -f "$APP/voice.env" ]; then
-  cp "$APP/voice.env.example" "$APP/voice.env"
-  echo "Created $APP/voice.env — edit it with your SIP account."
+say_step "4/4 — локальная конфигурация"
+if [ ! -f "$APP_DIR/.env" ]; then
+  install -m 600 "$APP_DIR/.env.example" "$APP_DIR/.env"
+  echo "Создан $APP_DIR/.env"
+else
+  echo "Существующий $APP_DIR/.env сохранён без изменений"
 fi
+chmod 600 "$APP_DIR/.env"
 
 cat <<EOF
 
-Setup complete.
+Установка завершена.
 
-⚠️  macOS OpenSSL fix (often REQUIRED — especially with python.org Python):
-    pjproject builds its dylibs with a flat namespace, so inside Python its
-    OpenSSL calls can bind to macOS LibreSSL instead of openssl@3 → calls fail
-    with MCP -32000 (srtp_init) or a segfault (SSL_CTX_new) on connect. If that
-    happens, run the relink helper:
+1. Заполните $APP_DIR/.env. Для рабочего звонка обязательны Telegram-токен,
+   ID пользователя/чата, публичный HTTPS URL, OPENAI_API_KEY и точная
+   модель OPENAI_MODEL, ELEVENLABS_API_KEY и ELEVENLABS_VOICE_ID.
+2. Добавьте действующий n8n MCP Trigger URL в MCP_SERVERS_JSON, чтобы ассистент
+   видел инструменты YCLIENTS.
+3. Запустите защищённую привязку Telegram; помощник выдаст одноразовую
+   команду /start, после чего повторите ту же команду:
 
-        PJPROJECT_DIR="$PJPROJECT_DIR" "$APP/fix_macos_twolevel.sh"
+     $VENV_PY $APP_DIR/configure_telegram.py discover --write
 
-    (Anaconda Python often avoids the collision and won't need it.) Full
-    root-cause writeup + symptom→fix table: docs/SETUP_MACOS.md
+4. Запустите самостоятельное приложение:
 
-Next steps:
-  1. Edit voice.env (already created for you) and fill in your 3 required SIP
-     vars: VOICE_SIP_ID, VOICE_SIP_USER, VOICE_SIP_PASS
-     (get a free account at https://subscribe.linphone.org).
-  2. Register ringback-voice with your MCP client:
+     $APP_DIR/run_app.sh
 
-     claude mcp add ringback-voice --scope user -- "$APP/run_voice_mcp.sh"
+   До запуска можно проверить заполнение без сетевых запросов:
 
-  3. Test: in a fresh Claude session, say "use ringback-voice to call me and say hi".
+     $APP_DIR/run_app.sh --check
 
-  (ringback-alert is optional — copy vars from alert.env.example into your MCP
-   client's env block; it runs via 'uv run server.py', no file to source.)
+По умолчанию речь обрабатывает ElevenLabs, поэтому локальные AI-модели не
+нужны. Для полностью локального резерва повторите установку так:
 
-If your python differs from the one above, set PYTHON_BIN and re-run.
-The whisper model is at: $MODEL_DIR/$WHISPER_MODEL_NAME
+  INSTALL_LOCAL_VOICE=1 $APP_DIR/setup.sh
+
+Для стабильного WebRTC на мобильных сетях добавьте свой TURN-сервер в
+WEBRTC_ICE_SERVERS_JSON.
 EOF

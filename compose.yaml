@@ -1,0 +1,25 @@
+services:
+  ringback:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      WEBRTC_HOST: 0.0.0.0
+      WEBRTC_PORT: 8765
+    ports:
+      # Caddy/Nginx on the host publishes this through HTTPS.
+      - "127.0.0.1:8765:8765"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

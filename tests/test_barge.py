@@ -9,25 +9,19 @@ the live call uses, with the SAME during-TX-floor threshold logic:
 This is the real-data check the earlier synthetic AEC work couldn't be: it runs only if the
 harvest fixtures exist (./tests/run_harvest.sh). Skips cleanly otherwise.
 """
-import importlib.util
 import json
 import math
 import os
 import struct
 import sys
-import types
 import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 REAL = os.path.join(HERE, "fixtures", "real")
+sys.path.insert(0, ROOT)
 
-pj = types.ModuleType("pjsua2")
-pj.Call = object
-sys.modules["pjsua2"] = pj
-spec = importlib.util.spec_from_file_location("voice_agent", os.path.join(ROOT, "voice_agent.py"))
-va = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(va)
+import voice_agent as va  # noqa: E402
 
 POLL, WIN = 0.08, 0.25     # live poll cadence + _tail_rms window
 

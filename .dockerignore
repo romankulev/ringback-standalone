@@ -1,12 +1,11 @@
 # Keep the build context small AND private. The image COPYs only what it needs;
 # this guarantees secrets and personal data never enter the build context.
 
-# secrets / local SIP identity
-voice.env
-alert.env
-*.docker.env
+# secrets / local configuration
 .env
-.env.example
+*.env.local
+*.pem
+*.key
 
 # PRIVATE: the user's harvested voice recordings (never ship these)
 tests/fixtures/real/
@@ -15,7 +14,7 @@ tests/fixtures/real/
 *.wav
 *.aiff
 
-# large model blobs (the image downloads its own)
+# optional local-fallback model blobs (never include them in the cloud image)
 *.bin
 models/
 
@@ -28,11 +27,9 @@ venv/
 .gitignore
 
 # local runtime logs/state
-channel/outbound.jsonl
-channel/*.log
-channel/.call_active
-channel/.stop_hook_state.json
-ntfy/*.db
+*.log
+*.pid
+runtime/
 
 # build artifacts / docs not needed at runtime
 dist/

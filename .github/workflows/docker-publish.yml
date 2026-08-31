@@ -1,9 +1,8 @@
 name: Build and publish Docker image (GHCR)
 
-# Publishes the ringback engine image to ghcr.io/<owner>/ringback as a MULTI-ARCH
-# manifest list (linux/amd64 + linux/arm64) so the Claude Code plugin pulls a native
-# image on every host (Linux servers / WSL2 + Apple Silicon Macs alike) with no local
-# build. Each arch is built on its OWN native runner (no QEMU emulation), pushed by
+# Publishes the standalone Ringback image to ghcr.io/<owner>/ringback as a
+# multi-arch manifest list (linux/amd64 + linux/arm64), suitable for Linux servers,
+# WSL2 and Apple Silicon hosts. Each arch is built on its own native runner, pushed by
 # digest, then a merge job stitches the digests into one tagged manifest list.
 #
 # The package is published public so anonymous `docker pull` works.
@@ -16,11 +15,16 @@ on:
     branches: [main]
     paths:
       - "Dockerfile"
-      - "voice_mcp.py"
+      - "standalone_app.py"
+      - "run_app.py"
       - "voice_agent.py"
+      - "webrtc_transport.py"
+      - "openai_agent.py"
+      - "remote_mcp.py"
       - "platform_compat.py"
-      - "server.py"
       - "aec.py"
+      - "web/**"
+      - "requirements.txt"
       - ".github/workflows/docker-publish.yml"
 
 env:

@@ -1,44 +1,34 @@
 #!/usr/bin/env python3
-"""One command to verify the voice engine OFFLINE — no phone call.
+"""One command to verify the WebRTC voice engine OFFLINE — no phone call.
 
     python3 tests/run_all.py
 
-Runs every offline test with the right interpreter (the AEC test needs the Python that
-has livekit) and prints a single pass/fail summary. This is the "test it with a script"
-entry point: capture, turn-logic, hallucination filter, frame-port de-risk, and the AEC
-core all checked without dialing anyone. (Live confirmation + real-echo AEC tuning is the
-separate one-call step: ./tests/run_harvest.sh then tests/tune_aec.py.)
+The default suite is deliberately deterministic and dependency-light: Telegram auth,
+ICE parsing, PCM snapshots/RMS, the remote Streamable-HTTP n8n MCP client, and an
+OpenAI tool round are checked with local data and fakes. It never needs Telegram,
+a microphone, bot/API keys, an MCP host installation, whisper.cpp, aiortc, or network
+access.
+
+The historical whisper/AEC/harvest probes remain available as individual scripts for
+manual media diagnostics; they are not suitable as a clean-install unit-test gate.
 """
 import os
-import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SYS = sys.executable
-# the AEC test imports livekit — prefer a python that has it
-ANACONDA = "/opt/anaconda3/bin/python3"
-LIVEKIT_PY = ANACONDA if os.path.exists(ANACONDA) else SYS
 
 SUITE = [
-    ("capture (full-sentence, lagging recorder)", "test_capture.py", SYS),
-    ("turn-logic (late-start fix, 1.5s endpoint, hallucination filter)", "test_turnlogic.py", SYS),
-    ("frame-port de-risk (records the NO-GO finding)", "test_frameports.py", SYS),
-    ("AEC core (echo cancellation on synthetic)", "test_aec.py", LIVEKIT_PY),
-    ("barge-in on REAL harvested audio (skips if no harvest)", "test_barge.py", SYS),
+    ("WebRTC auth, ICE, and inbound PCM", "test_webrtc_transport.py", SYS),
+    ("Standalone Telegram/OpenAI application", "test_standalone_app.py", SYS),
+    ("Remote MCP configuration, SSE session, and tool policy", "test_remote_mcp.py", SYS),
+    ("OpenAI MCP tool-call round", "test_openai_agent.py", SYS),
+    ("ElevenLabs cloud speech-to-text", "test_cloud_stt.py", SYS),
 ]
 
 
-def gen_fixtures_if_needed():
-    if not os.path.exists(os.path.join(HERE, "fixtures", "long_sentence.wav")):
-        print("generating fixtures...")
-        subprocess.run([SYS, os.path.join(HERE, "gen_fixtures.py")], check=True)
-
-
 def main():
-    if not shutil.which("whisper-cli") and not shutil.which("whisper-server"):
-        print("warning: whisper not found in PATH; transcription tests will be weak")
-    gen_fixtures_if_needed()
     results = []
     for name, script, py in SUITE:
         print(f"\n{'=' * 70}\n# {name}\n{'=' * 70}")

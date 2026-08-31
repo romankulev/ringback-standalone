@@ -1,23 +1,30 @@
-"""platform_compat.py — OS abstraction seams for ringback (macOS / Linux / Windows).
+"""platform_compat.py — OS and speech-provider seams for the standalone app.
 
-The voice + alert engines are otherwise platform-neutral; the OS-specific bits live
-here so voice_agent.py / server.py / channel/stop_hook.py stay clean:
+The standalone voice engine is otherwise platform-neutral; OS-specific bits live
+here so the application and WebRTC layers stay clean:
   - detached_popen_kwargs(): spawn a child that outlives the parent (POSIX vs Windows)
   - lib_path_var():          name of the dynamic-linker search-path env var per OS
   - hid_idle_seconds():      seconds since last user input (presence detection)
-  - synthesize_to_wav():     text -> 16 kHz mono 16-bit WAV via Piper (default) /
-                             say / espeak / SAPI / a custom command
+  - transcribe_wav_elevenlabs(): WAV -> text through ElevenLabs Scribe
+  - synthesize_to_wav():     text -> 16 kHz mono 16-bit WAV via ElevenLabs,
+                             optional Piper, say, espeak, SAPI, or custom command
 
-Nothing here imports pjsua2 or any heavy dependency, so it is safe to import anywhere.
+Nothing here imports the WebRTC stack, so it is safe to import anywhere.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
+
+import httpx
 
 IS_MAC = sys.platform == "darwin"
 IS_WIN = os.name == "nt" or sys.platform.startswith("win")
@@ -29,7 +36,9 @@ FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 # AND the voice model file exists; otherwise we transparently fall back to the OS voice.
 PIPER_BIN = os.environ.get("VOICE_PIPER_BIN", "piper")
 PIPER_MODEL = os.environ.get(
-    "VOICE_PIPER_MODEL", os.path.expanduser("~/.piper-voices/en_US-lessac-medium.onnx"))
+    "VOICE_PIPER_MODEL", os.path.expanduser("~/.piper-voices/ru_RU-irina-medium.onnx"))
+
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 
 
 def _rm(path: str) -> None:
@@ -39,10 +48,122 @@ def _rm(path: str) -> None:
         pass
 
 
+def _temp_path(suffix: str) -> str:
+    """Reserve a private temporary path without the race inherent in ``mktemp``."""
+    fd, path = tempfile.mkstemp(prefix="ringback-", suffix=suffix)
+    os.close(fd)
+    return path
+
+
+# ---- speech-to-text ---------------------------------------------------------
+async def transcribe_wav_elevenlabs(
+    wav_path: str,
+    *,
+    language_code: str | None = "ru",
+    client: httpx.AsyncClient | None = None,
+) -> str:
+    """Transcribe one WAV with ElevenLabs' asynchronous Scribe REST API.
+
+    The caller may supply an ``httpx.AsyncClient`` (used by offline tests and by
+    applications that pool connections).  File reading is sent to a worker thread,
+    and the HTTP request is asynchronous, so this function never blocks its event
+    loop.  Errors deliberately omit request URLs, headers and response bodies because
+    provider diagnostics can contain credentials or customer audio metadata.
+    """
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    model_id = os.environ.get("ELEVENLABS_STT_MODEL_ID", "").strip() or "scribe_v2"
+    if not api_key:
+        raise RuntimeError(
+            "VOICE_STT=elevenlabs requires ELEVENLABS_API_KEY"
+        )
+    if not os.path.isfile(wav_path):
+        raise RuntimeError("ElevenLabs STT audio file is unavailable")
+
+    try:
+        audio = await asyncio.to_thread(_read_bytes, wav_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"ElevenLabs STT could not read audio ({type(exc).__name__})"
+        ) from None
+
+    data = {
+        "model_id": model_id,
+        "tag_audio_events": "false",
+        "diarize": "false",
+        "timestamps_granularity": "none",
+        "file_format": "other",
+    }
+    normalized_language = (language_code or "").strip().lower()
+    if normalized_language and normalized_language != "auto":
+        data["language_code"] = normalized_language
+    files = {"file": ("turn.wav", audio, "audio/wav")}
+    headers = {"xi-api-key": api_key}
+
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+    try:
+        response = await http.post(
+            ELEVENLABS_STT_URL,
+            headers=headers,
+            data=data,
+            files=files,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"ElevenLabs STT request failed ({type(exc).__name__})"
+        ) from None
+    finally:
+        if owns_client:
+            try:
+                await http.aclose()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"ElevenLabs STT connection cleanup failed ({type(exc).__name__})"
+                ) from None
+
+    if not 200 <= response.status_code < 300:
+        raise RuntimeError(f"ElevenLabs STT returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+        text = payload.get("text") if isinstance(payload, dict) else None
+    except Exception:
+        text = None
+    if not isinstance(text, str):
+        raise RuntimeError("ElevenLabs STT returned an invalid response")
+    return text
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as src:
+        return src.read()
+
+
+def transcribe_wav_elevenlabs_sync(
+    wav_path: str,
+    *,
+    language_code: str | None = "ru",
+) -> str:
+    """Synchronous adapter for the dedicated call-worker thread.
+
+    ``StandaloneApp`` runs every ``CallSession`` on its own worker thread.  Refuse
+    use from an active asyncio loop so an accidental direct call cannot freeze the
+    Telegram/WebRTC event loop; async callers use :func:`transcribe_wav_elevenlabs`.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            transcribe_wav_elevenlabs(wav_path, language_code=language_code)
+        )
+    raise RuntimeError(
+        "ElevenLabs STT sync adapter cannot run inside an active event loop"
+    )
+
+
 # ---- detached child processes ------------------------------------------------
 def detached_popen_kwargs() -> dict:
     """subprocess.Popen kwargs to fully detach a child so it outlives this process and
-    isn't reaped when we exit (whisper-server, baresip, the call driver). POSIX starts a
+    isn't reaped when we exit (whisper-server, the call driver). POSIX starts a
     new session; Windows uses detached / new-process-group creation flags."""
     if IS_WIN:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
@@ -53,8 +174,7 @@ def detached_popen_kwargs() -> dict:
 
 # ---- dynamic-linker search path ----------------------------------------------
 def lib_path_var() -> str:
-    """Name of the env var the OS uses to find shared libraries at runtime (pjproject's
-    dylibs/so's + OpenSSL). The launcher sets this to the pj lib dirs."""
+    """Name of the env var the OS uses to find shared libraries at runtime."""
     if IS_MAC:
         return "DYLD_LIBRARY_PATH"
     if IS_WIN:
@@ -146,8 +266,11 @@ def piper_available() -> bool:
 
 
 def tts_engine() -> str:
-    """Which TTS engine to use. VOICE_TTS forces it (piper|say|espeak|sapi); the default
-    'auto' prefers Piper when installed, else the OS-native fast path."""
+    """Select TTS. VOICE_TTS may be piper, elevenlabs, say, espeak, or sapi.
+
+    ``auto`` deliberately prefers free local speech so merely adding an ElevenLabs
+    key never starts billable requests without an explicit VOICE_TTS=elevenlabs.
+    """
     choice = os.environ.get("VOICE_TTS", "auto").strip().lower()
     if choice and choice != "auto":
         return choice
@@ -161,19 +284,19 @@ def tts_engine() -> str:
 
 
 def _ffmpeg_to_16k_mono(src: str, dst: str) -> None:
-    """Normalize any TTS output to the 16 kHz mono 16-bit PCM WAV pjsua2 expects."""
+    """Normalize any TTS output for STT and the WebRTC audio bridge."""
     subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", src,
                     "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", dst], check=True)
 
 
 def _synth_say(text: str) -> str:
-    aiff = tempfile.mktemp(suffix=".aiff")
+    aiff = _temp_path(".aiff")
     subprocess.run(["say", "-o", aiff, text], check=True)
     return aiff
 
 
 def _synth_piper(text: str) -> str:
-    wav = tempfile.mktemp(suffix=".wav")
+    wav = _temp_path(".wav")
     # piper reads the text on stdin and writes a WAV to -f/--output_file. The matching
     # <model>.onnx.json config must sit next to the .onnx model.
     subprocess.run([PIPER_BIN, "-m", PIPER_MODEL, "-f", wav],
@@ -183,14 +306,48 @@ def _synth_piper(text: str) -> str:
 
 
 def _synth_espeak(text: str) -> str:
-    wav = tempfile.mktemp(suffix=".wav")
+    wav = _temp_path(".wav")
     exe = shutil.which("espeak-ng") or shutil.which("espeak") or "espeak-ng"
     subprocess.run([exe, "-w", wav, text], check=True)
     return wav
 
 
+def _synth_elevenlabs(text: str) -> str:
+    """Generate one complete utterance with ElevenLabs' synchronous TTS API."""
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+    model_id = os.environ.get("ELEVENLABS_MODEL_ID", "").strip() or "eleven_multilingual_v2"
+    if not api_key or not voice_id:
+        raise RuntimeError(
+            "VOICE_TTS=elevenlabs requires ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID"
+        )
+    url = (
+        "https://api.elevenlabs.io/v1/text-to-speech/"
+        + urllib.parse.quote(voice_id, safe="")
+        + "?output_format=mp3_44100_128"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"text": text, "model_id": model_id}).encode("utf-8"),
+        headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    mp3 = _temp_path(".mp3")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, open(mp3, "wb") as out:
+            out.write(response.read())
+    except Exception as exc:
+        _rm(mp3)
+        # Never propagate urllib's provider/request representation: keep auth headers
+        # and response bodies out of application logs.
+        raise RuntimeError(
+            f"ElevenLabs TTS request failed ({type(exc).__name__})"
+        ) from None
+    return mp3
+
+
 def _synth_sapi(text: str) -> str:
-    wav = tempfile.mktemp(suffix=".wav")
+    wav = _temp_path(".wav")
     ps = (
         "Add-Type -AssemblyName System.Speech; "
         "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
@@ -206,7 +363,7 @@ def _synth_sapi(text: str) -> str:
 def _synth_custom(template: str, text: str) -> str:
     """VOICE_TTS_CMD is a command template with {text} and {out} placeholders, e.g.
     'mytts --say {text} --wav {out}'. It must write a WAV file to {out}."""
-    wav = tempfile.mktemp(suffix=".wav")
+    wav = _temp_path(".wav")
     cmd = [a.replace("{out}", wav).replace("{text}", text) for a in shlex.split(template)]
     subprocess.run(cmd, check=True)
     return wav
@@ -217,6 +374,8 @@ def _dispatch(engine: str, text: str) -> str:
         return _synth_piper(text)
     if engine == "say":
         return _synth_say(text)
+    if engine in ("elevenlabs", "eleven-labs"):
+        return _synth_elevenlabs(text)
     if engine in ("espeak", "espeak-ng"):
         return _synth_espeak(text)
     if engine == "sapi":
@@ -229,7 +388,7 @@ def _os_native_engine() -> str:
 
 
 def synthesize_to_wav(text: str, out_wav: str) -> str:
-    """Render `text` to a 16 kHz mono 16-bit PCM WAV at `out_wav` (pjsua2's format).
+    """Render ``text`` to a 16 kHz mono 16-bit PCM WAV at ``out_wav``.
 
     Engine selected by VOICE_TTS (default 'auto': Piper if installed, else the OS-native
     voice). VOICE_TTS_CMD overrides everything with a custom command template. If the

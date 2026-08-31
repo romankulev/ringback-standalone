@@ -8,9 +8,9 @@ filtering background noise. This is what lets barge-in work on speaker WITHOUT t
 half-duplex workaround.
 
 Operates on 16 kHz mono int16 PCM. APM requires exactly 10 ms (160-sample) frames, so
-this buffers arbitrary input sizes (pjsua delivers ~20 ms) into 10 ms chunks.
+this buffers the resampled WebRTC input into 10 ms chunks.
 
-The genuine open risk is DELAY: our echo returns over RTP (caller speaker -> mic ->
+The genuine open risk is DELAY: our echo returns over WebRTC (caller speaker -> mic ->
 network), so the reference leads the echo by ~100-250 ms and it drifts. set_stream_delay
 tells AEC3 the offset; tune VOICE_AEC_DELAY_MS on a live call.
 """

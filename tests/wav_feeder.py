@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""GrowingWav — simulate a live pjsua AudioMediaRecorder for offline tests.
+"""GrowingWav — simulate a growing live recorder for offline tests.
 
-pjsua's recorder writes a WAV header with a STALE (zero) data-size, then appends PCM
+Some recorders write a WAV header with a STALE (zero) data-size, then append PCM
 over wall-clock time, only fixing the header on close. That is the exact condition
 voice_agent._wav_snapshot() exists to handle. This reproduces it from a fixture WAV so
 the capture loop can be tested with no phone call.
