@@ -707,7 +707,17 @@
         if (connection.iceGatheringState === "complete") finish();
       }
       connection.addEventListener("icegatheringstatechange", onStateChange);
-      timeout = setTimeout(function () { finish(new Error("ICE_GATHERING_TIMEOUT")); }, timeoutMs);
+      timeout = setTimeout(function () {
+        // Some Telegram Desktop/network combinations block public STUN while
+        // still producing a usable host candidate. Non-trickle ICE used to
+        // discard that candidate and fail the call before the offer reached
+        // the server. Send the partial SDP when at least one candidate exists;
+        // fail only when gathering produced nothing at all.
+        const description = connection.localDescription;
+        const sdp = description && typeof description.sdp === "string" ? description.sdp : "";
+        if (/(?:^|\r?\n)a=candidate:/m.test(sdp)) finish();
+        else finish(new Error("ICE_GATHERING_TIMEOUT"));
+      }, timeoutMs);
     });
   }
 
